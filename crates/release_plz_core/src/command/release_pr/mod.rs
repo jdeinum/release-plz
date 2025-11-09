@@ -119,7 +119,15 @@ pub struct PrPackageRelease {
 ///   are up-to-date.
 #[instrument(skip_all)]
 pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<ReleasePr>> {
+    // the manifest we'll be updating with the PR (i.e package_version)
     let manifest_dir = input.update_request.local_manifest_dir()?;
+
+    // In both local and CI, we'll be checking out HEAD of the default branch, which we don't want
+    // to update directly. Instead, we create a local copy that we can update. Then we can create a
+    // PR from that.
+    //
+    // TODO: This should be done with git worktrees, rather than copying directly
+    // See 3245cf0
     let original_project_root = root_repo_path_from_manifest_dir(manifest_dir)?;
     let tmp_project_root_parent = copy_to_temp_dir(&original_project_root)?;
     let tmp_project_manifest_dir = new_manifest_dir_path(
@@ -128,16 +136,23 @@ pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<Relea
         tmp_project_root_parent.path(),
     )?;
 
+    // users can attach labels to pull requests for whatever reason they want, but we need to make
+    // sure that they conform to our spec.
     validate_labels(&input.labels)?;
     let tmp_project_root =
         new_project_root(&original_project_root, tmp_project_root_parent.path())?;
 
+    // update the local manifest to our new copied directory
     let local_manifest = tmp_project_manifest_dir.join(CARGO_TOML);
+
+    // update the update request with the new local manifest
     let new_update_request = input
         .update_request
         .clone()
         .set_local_manifest(&local_manifest)
         .context("can't find temporary project")?;
+
+    // determine what packages we will be updating
     let (packages_to_update, _temp_repository) = update(&new_update_request)
         .await
         .context("failed to update packages")?;

@@ -37,6 +37,7 @@ pub struct ReleaseInfo {
 }
 
 /// Update a local Rust project.
+///
 #[instrument(skip_all)]
 pub async fn update(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, TempRepo)> {
     let (packages_to_update, repository) = crate::next_versions(input)

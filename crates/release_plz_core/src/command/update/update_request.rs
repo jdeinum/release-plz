@@ -45,6 +45,13 @@ pub struct UpdateRequest {
     /// Prepare release only if at least one commit respects a regex.
     release_commits: Option<Regex>,
     git: Option<GitForge>,
+
+    /// Use git tags to determine latest package release
+    git_only: Option<bool>,
+
+    /// The regex used to determine releases from git tags
+    /// TODO: We may have to split this up into a prefix and suffix
+    git_only_tag_regex: Option<Regex>,
 }
 
 impl UpdateRequest {
@@ -64,6 +71,8 @@ impl UpdateRequest {
             packages_config: PackagesConfig::default(),
             release_commits: None,
             git: None,
+            git_only: None,
+            git_only_tag_regex: None,
         })
     }
 
@@ -229,6 +238,14 @@ impl UpdateRequest {
 
     pub fn release_commits(&self) -> Option<&Regex> {
         self.release_commits.as_ref()
+    }
+
+    pub fn git_only(&self) -> Option<bool> {
+        self.git_only
+    }
+
+    pub fn git_only_tag_regex(&self) -> Option<&Regex> {
+        self.git_only_tag_regex.as_ref()
     }
 }
 

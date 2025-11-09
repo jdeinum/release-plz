@@ -111,6 +111,13 @@ pub struct Update {
     /// Kind of git host where your project is hosted.
     #[arg(long, visible_alias = "backend", value_enum, default_value_t = GitForgeKind::Github)]
     forge: GitForgeKind,
+
+    /// Use git tags to determine latest package release
+    git_only: Option<bool>,
+
+    /// The regex used to determine releases from git tags
+    /// TODO: We may have to split this up into a prefix and suffix
+    git_only_tag_regex: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,14 +174,24 @@ impl Update {
         config: &Config,
         cargo_metadata: cargo_metadata::Metadata,
     ) -> anyhow::Result<UpdateRequest> {
+        // if we provided a manifest, use that instead of the current dir
         let project_manifest = self.manifest_path();
+
+        // Check lock file
         check_if_cargo_lock_is_ignored_and_committed(&project_manifest)?;
+
+        // create the update request
         let mut update = UpdateRequest::new(cargo_metadata)
             .with_context(|| {
                 format!("Cannot find file {project_manifest:?}. Make sure you are inside a rust project or that --manifest-path points to a valid Cargo.toml file.")
             })?
             .with_dependencies_update(self.dependencies_update(config))
             .with_allow_dirty(self.allow_dirty(config));
+
+        // the repository url is used for links within the changelogs to the release
+        // normally you don't need to populate it because release-plz will default to the remote
+        // url inside of the Cargo.toml , but users can optionally provide it in the config file /
+        // on the command line
         match self.get_repo_url(config) {
             Ok(repo_url) => {
                 update = update.with_repo_url(repo_url);
@@ -185,6 +202,8 @@ impl Update {
             ),
         }
 
+        // if a registry_manifest_path is provided, we use that Cargo.toml to determine the current
+        // version of the published package.
         if let Some(registry_manifest_path) = &self.registry_manifest_path {
             let registry_manifest_path = to_utf8_path(registry_manifest_path)?;
             update = update
@@ -193,8 +212,12 @@ impl Update {
                     format!("cannot find project manifest {registry_manifest_path:?}")
                 })?;
         }
+
+        // override workspace configuration with package specific configuration
         update = config.fill_update_config(self.no_changelog, update);
+
         {
+            // update the release date
             let release_date = self
                 .release_date
                 .as_ref()
@@ -203,13 +226,18 @@ impl Update {
                         .context("cannot parse release_date to y-m-d format")
                 })
                 .transpose()?;
+
+            // create the pr link
             let pr_link = update.repo_url().map(|url| url.git_pr_link());
+
+            // update the changelog request with cli args / config options
             let changelog_req = ChangelogRequest {
                 release_date,
                 changelog_config: Some(self.changelog_config(config, pr_link.as_deref())?),
             };
             update = update.with_changelog_req(changelog_req);
         }
+
         if let Some(package) = &self.package {
             update = update.with_single_package(package.clone());
         }
@@ -310,6 +338,8 @@ mod tests {
             config: ConfigPath::default(),
             forge: GitForgeKind::Github,
             git_token: None,
+            git_only: None,
+            git_only_tag_regex: None,
         };
         let config = update_args.config.load().unwrap();
         let req = update_args

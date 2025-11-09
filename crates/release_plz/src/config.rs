@@ -165,6 +165,26 @@ pub struct Workspace {
     ///   `release-plz-`. So if you want to create a PR that should trigger a release
     ///   (e.g. when you fix the CI), use this branch name format (e.g. `release-plz-fix-ci`).
     pub release_always: Option<bool>,
+
+    /// Use git tags for release information
+    /// Default: false
+    ///
+    /// If true, release-plz will use git tags to determine what the latest version of the package
+    /// is (i.e newest version is v.0.1.3 and is associated with commit ac83762)
+    /// If false, release-plz will use crates.io release information to get the latest version
+    ///
+    /// If you use this, you're required to provide a regex that is used to match against tag
+    /// messages in order to distinguish a release versus some other tag
+    pub git_only: Option<bool>,
+
+    /// The regex used to identity releases from git tags
+    /// Because git tags can have arbitrary messages attached to them, release-plz needs some way
+    /// of knowing the difference between a release and non release.
+    ///
+    /// NOTE: The tag needs to contain a semantic version somewhere in the tag. If it doesn't, we
+    /// should error out early. A better option may be that we can specify a prefix and postfix as
+    /// separate fields and expect a full a.b.c in the middle, that way users can never forget it
+    pub git_only_release_regex: Option<String>,
 }
 
 impl Workspace {
@@ -517,6 +537,8 @@ mod tests {
                 publish_timeout: Some("10m".to_string()),
                 release_commits: Some("^feat:".to_string()),
                 release_always: None,
+                git_only: None,
+                git_only_release_regex: None,
             },
             package: [].into(),
         }
@@ -641,6 +663,8 @@ mod tests {
                 publish_timeout: Some("10m".to_string()),
                 release_commits: Some("^feat:".to_string()),
                 release_always: None,
+                git_only: None,
+                git_only_release_regex: None,
             },
             package: [PackageSpecificConfigWithName {
                 name: "crate1".to_string(),

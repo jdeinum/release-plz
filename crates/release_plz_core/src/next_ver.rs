@@ -20,7 +20,7 @@ use cargo_metadata::{
 use chrono::NaiveDate;
 use std::path::PathBuf;
 use toml_edit::TableLike;
-use tracing::{instrument, trace};
+use tracing::{debug, instrument, trace};
 
 // Used to indicate that this is a dummy commit with no corresponding ID available.
 // It should be at least 7 characters long to avoid a panic in git-cliff
@@ -57,6 +57,8 @@ impl ReleaseMetadataBuilder for UpdateRequest {
 }
 
 /// Determine next version of packages
+/// Any packages that will be updated will be returned, alongside whether we update the workspace
+/// The temp repository is the
 #[instrument(skip_all)]
 pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, TempRepo)> {
     let overrides = input.packages_config().overridden_packages();
@@ -71,27 +73,65 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
         project: &local_project,
         req: input,
     };
+
+    let release_packages = if input.git_only().is_some()
+    // If we are only using git-only mode, we parse the commits in the unpublished repositry using
+    // the git_only_release_tag_regex until we reach a commit that matches the spec. At that point
+    // we need to checkout that version somewhere on our local file system. We can then pass on.
+    //
+    // TODO: Implement this :D
+    {
+        debug!("Git only mode enabled, using git tags for release info");
+
+        // If the local manifest path is populated (i.e from CLI args) then we always prefer that,
+        // otherwise we'll create a local copy of the released package and provide the path to its
+        // Cargo.toml
+        let local_release_path = input.registry_manifest().unwrap_or_else(|| {
+            // copy the release checkout into /tmp using git worktrees
+
+            // make it look like a package release... somehow?
+
+            // get & return the path to the Cargo.toml
+            Utf8Path::new("")
+        });
+        debug!("Using local package for current latest release info at {local_release_path}");
+
+        // we can just pass on our local copy of the package, the rest of the system doesn't even
+        // have to know
+        registry_packages::get_registry_packages(
+            Some(local_release_path),
+            &local_project.publishable_packages(),
+            input.registry(),
+        )
+    }
     // Retrieve the latest published version of the packages.
     // Release-plz will compare the registry packages with the local packages,
     // to determine the new commits.
-    let registry_packages = registry_packages::get_registry_packages(
-        input.registry_manifest(),
-        &local_project.publishable_packages(),
-        input.registry(),
-    )?;
+    else {
+        debug!("Using registry packages for release info!");
+        registry_packages::get_registry_packages(
+            input.registry_manifest(),
+            &local_project.publishable_packages(),
+            input.registry(),
+        )
+    }?;
 
-    let repository = local_project
+    // The repository that contains the unpublished changes
+    let unreleased_repo = local_project
         .get_repo()
         .context("failed to determine local project repository")?;
 
-    let repo_is_clean_result = repository.repo.is_clean();
+    // If our unreleased_repo contains changes that aren't checked in to git and we don't allow
+    // dirty repos, we error out. Otherwise, we just stash the changes. Note that because these
+    // changes aren't commited, no version change would occur because of them.
+    let repo_is_clean_result = unreleased_repo.repo.is_clean();
     if !input.allow_dirty() {
         repo_is_clean_result?;
     } else if repo_is_clean_result.is_err() {
         // Stash uncommitted changes so we can freely check out other commits.
         // This function is ran inside a temporary repository, so this has no
         // effects on the original repository of the user.
-        repository.repo.git(&[
+        unreleased_repo.repo.git(&[
             "stash",
             "push",
             "--include-untracked",
@@ -99,10 +139,15 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
             "uncommitted changes stashed by release-plz",
         ])?;
     }
+
     let packages_to_update = updater
-        .packages_to_update(&registry_packages, &repository.repo, input.local_manifest())
+        .packages_to_update(
+            &release_packages,
+            &unreleased_repo.repo,
+            input.local_manifest(),
+        )
         .await?;
-    Ok((packages_to_update, repository))
+    Ok((packages_to_update, unreleased_repo))
 }
 
 pub fn root_repo_path(local_manifest: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {

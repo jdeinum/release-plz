@@ -1,3 +1,4 @@
+use crate::cargo::run_cargo;
 use crate::update_request::UpdateRequest;
 use crate::updater::Updater;
 use crate::{
@@ -11,7 +12,6 @@ use crate::{
     tmp_repo::TempRepo,
 };
 use anyhow::Context;
-use cargo::sources::git::fetch::Error;
 use cargo_metadata::TargetKind;
 use cargo_metadata::{
     Metadata, Package,
@@ -20,9 +20,8 @@ use cargo_metadata::{
 };
 use chrono::NaiveDate;
 use git_cmd::Repo;
-use std::fmt::format;
-use std::io::{self, ErrorKind};
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::PathBuf;
 use toml_edit::TableLike;
 use tracing::{debug, instrument, trace, warn};
 
@@ -120,52 +119,57 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
         );
         debug!("unreleased worktree located at {unreleased_package_worktree_path}");
 
-        // We still have to check if this worktree exists already. It shouldn't, but because NTP
-        // could in theory step the clock back, we may as well check.
-        let f = tokio::fs::File::open(&unreleased_package_worktree_path).await;
-
-        // doesn't exist, great
-        if f.as_ref().is_err_and(|x| x.kind() == ErrorKind::NotFound) {
-            debug!("{unreleased_package_worktree_path} not found, nothing to delete");
-        }
-        // does exist, delete it
-        else {
-            match f?.metadata().await {
-                Ok(m) if m.is_dir() => {
-                    warn!(
-                        "{unreleased_package_worktree_path} already exists, are you a time traveller? Just kidding, but we are deleting it for consistency"
-                    );
-                    tokio::fs::remove_dir_all(&unreleased_package_worktree_path)
-                        .await
-                        .context("delete existing unreleased package")?;
-                }
-
-                // either file or symlink, i don't think we care though? we'll just remove it
-                Ok(_) => {
-                    warn!(
-                        "{unreleased_package_worktree_path} already exists as a file, deleting it"
-                    );
-                    tokio::fs::remove_file(&unreleased_package_worktree_path)
-                        .await
-                        .context("delete existing unreleased package file")?;
-                }
-
-                // if its not found, then great!
-                Err(e) => return Err(anyhow::anyhow!(e)),
-            };
-        }
+        // delete the existing worktree if it exists
+        // TODO: I think we may actually do this prior to calling this function (where the other
+        // TODO is, if that is the case, delete it here )
+        delete_existing_worktree(unreleased_package_worktree_path.as_str().into())
+            .await
+            .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
 
         // create the worktree at HEAD
         let unreleased_package_worktree = unreleased_package_repo
-            .add_worktree(unreleased_package_worktree_path, None)
+            .add_worktree(&unreleased_package_worktree_path, None)
             .context("create git worktree")?;
 
-        // now we scan the commit history to find the commits that satisfy
+        // now we scan the commit history to find the commits that satisfy our regex
+        // TODO
+        let commit = "this isnt a sha1 you silly goose";
+
+        // create a new worktree at the specfied commit
+        let latest_release_package_path = format!(
+            "/tmp/{}/latest_release",
+            input.cargo_metadata().workspace_root,
+        );
+        debug!("latest release worktree located at {latest_release_package_path}");
+        delete_existing_worktree(latest_release_package_path.as_str().into())
+            .await
+            .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
+
+        // create our new copy of the worktree
+        let latest_release_worktree = unreleased_package_repo
+            .add_worktree(&latest_release_package_path, Some(commit))
+            .context("create git worktree")?;
+
+        // run cargo package to produce our package
+        run_cargo(latest_release_package_path.as_str().into(), &["package"])
+            .context("create cargo package")?;
+
+        // create a git repository in the packaged version
+        // pretty sure theres a git client we can use for this
+        // TODO
+
+        // get the path to the new packaged version, the updated path is at
+        // /tmp/package_name/target/package/package_name-0.1.0
+        // so either we need to use the specific version from metadata or we need to find it
+        // dynamically. Once thing I am, unsure about is how this plays out with workspaces. There
+        // would be a directory for each of the packages in the workspace, but they aren't in a
+        // real workspace from cargos perspective.
 
         // If the local manifest path is populated (i.e from CLI args) then we always prefer that,
         // otherwise we'll create a local copy of the released package and provide the path to its
         // Cargo.toml.
-        let local_release_path = Utf8Path::new("");
+        let local_release_path = format!("{latest_release_package_path}/target/package");
+        let local_release_path = Utf8Path::new(&local_release_path);
         let local_release_path = input.registry_manifest().unwrap_or(local_release_path);
         debug!("Using local package for current latest release info at {local_release_path}");
 
@@ -221,6 +225,43 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
         )
         .await?;
     Ok((packages_to_update, unreleased_repo))
+}
+
+pub async fn delete_existing_worktree(path: &Utf8Path) -> anyhow::Result<()> {
+    // We still have to check if this worktree exists already. It shouldn't, but because NTP
+    // could in theory step the clock back, we may as well check.
+    let f = tokio::fs::File::open(&path).await;
+
+    // doesn't exist, great
+    if f.as_ref().is_err_and(|x| x.kind() == ErrorKind::NotFound) {
+        debug!("{path} not found, nothing to delete");
+    }
+    // does exist, delete it
+    else {
+        match f?.metadata().await {
+            Ok(m) if m.is_dir() => {
+                warn!(
+                    "{path} already exists, are you a time traveller? Just kidding, but we are deleting it for consistency"
+                );
+                tokio::fs::remove_dir_all(&path)
+                    .await
+                    .context("delete existing unreleased package")?;
+            }
+
+            // either file or symlink, i don't think we care though? we'll just remove it
+            Ok(_) => {
+                warn!("{path} already exists as a file, deleting it");
+                tokio::fs::remove_file(&path)
+                    .await
+                    .context("delete existing unreleased package file")?;
+            }
+
+            // if its not found, then great!
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        };
+    }
+
+    Ok(())
 }
 
 pub fn root_repo_path(local_manifest: &Utf8Path) -> anyhow::Result<Utf8PathBuf> {

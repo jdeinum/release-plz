@@ -12,7 +12,6 @@ use crate::{
     tmp_repo::TempRepo,
 };
 use anyhow::Context;
-use cargo::ops::info;
 use cargo_metadata::TargetKind;
 use cargo_metadata::{
     Metadata, Package,
@@ -141,7 +140,7 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
                 .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
 
             // create a worktree for the latest released version
-            let _latest_release_worktree = unreleased_package_worktree
+            unreleased_package_worktree
                 .add_worktree(&latest_release_worktree_path, Some(&commit))
                 .context("create git worktree for latest release")?;
 
@@ -150,13 +149,16 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
                 .context("create cargo package")?;
 
             let latest_release_package_path =
-                format!("{latest_release_worktree_path}/target/package");
+                format!("{latest_release_worktree_path}/target/package/test_release_plz-0.1.0");
 
             // create a git repository in the packaged version to make sure comparisons are equivilent
+            info!(
+                "initializing git repo in the latest release package at {latest_release_package_path}"
+            );
             Repo::init_simple(&latest_release_package_path)
                 .context("create git repo for package dir")?;
 
-            local_release_path = Some(latest_release_package_path);
+            local_release_path = Some(format!("{latest_release_package_path}/Cargo.toml"));
         }
         // NOTE: If no tags match the regex, I believe we default to using the registry for the
         // first release, which will throw and error, and instead say the

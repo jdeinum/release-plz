@@ -42,22 +42,20 @@ impl Repo {
     /// NOTE: This function doesn't set the author / email, nor does it provide any commits. Some
     /// git actions may behave differently if there isn't a commit.
     #[instrument(skip(path), fields(path = path.as_ref().as_str()))]
-    pub fn init_simple(path: impl AsRef<Utf8Path>) -> anyhow::Result<Option<Self>> {
+    pub fn init_simple(path: impl AsRef<Utf8Path>) -> anyhow::Result<()> {
         // first, we check if the repo exists
         if std::path::Path::new(&format!("{}/.git", path.as_ref().as_str())).exists() {
             debug!(
                 "git repository already exists at {}, not creating a new one",
                 path.as_ref()
             );
-            return Ok(None);
+            return Ok(());
         }
 
         // create the repo
         git_in_dir(path.as_ref(), &["init"]).context("init git directory")?;
-        let repo = Repo::new(&path).context("create new git repository")?;
-        debug!("created new git repository at {}", path.as_ref());
-
-        Ok(Some(repo))
+        debug!("initialized repo at {}", path.as_ref());
+        Ok(())
     }
 
     pub fn directory(&self) -> &Utf8Path {
@@ -245,7 +243,7 @@ impl Repo {
         &self,
         path: impl AsRef<Utf8Path>,
         object: Option<&str>,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<()> {
         if let Some(commit) = object {
             self.git(&["worktree", "add", "-f", path.as_ref().as_str(), commit])
                 .context(format!("create git worktree at commit {commit}"))?;
@@ -254,7 +252,7 @@ impl Repo {
                 .context("create git worktree at HEAD")?;
         }
 
-        Ok(Self::new(path)?)
+        Ok(())
     }
 
     /// Removes a worktree that was created for this repository at the given path.

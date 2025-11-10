@@ -147,7 +147,7 @@ pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<Relea
         .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
 
     // create the worktree at HEAD
-    let _unreleased_package_worktree = unreleased_package_repo
+    unreleased_package_repo
         .add_worktree(&unreleased_package_worktree_path, None)
         .context("create git worktree for unreleased package")?;
 

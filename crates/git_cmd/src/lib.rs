@@ -216,11 +216,28 @@ impl Repo {
     }
 
     /// Adds a detached git worktree at the given path checked out at the given object.
-    pub fn add_worktree(&self, path: impl AsRef<str>, object: &str) -> anyhow::Result<()> {
-        self.git(&["worktree", "add", "--detach", path.as_ref(), object])
-            .context("failed to create git worktree")?;
+    /// If object is none, we checkout at HEAD
+    /// Returns a new repo object at the new worktree
+    pub fn add_worktree(
+        &self,
+        path: impl AsRef<Utf8Path>,
+        object: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        if let Some(commit) = object {
+            self.git(&[
+                "worktree",
+                "add",
+                "--detach",
+                path.as_ref().as_str(),
+                commit,
+            ])
+            .context("create git worktree at {object}")?;
+        } else {
+            self.git(&["worktree", "add", path.as_ref().as_str()])
+                .context("create git worktree at HEAD")?;
+        }
 
-        Ok(())
+        Ok(Self::new(path)?)
     }
 
     /// Removes a worktree that was created for this repository at the given path.

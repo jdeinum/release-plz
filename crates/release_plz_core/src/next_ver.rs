@@ -11,6 +11,7 @@ use crate::{
     tmp_repo::TempRepo,
 };
 use anyhow::Context;
+use cargo::sources::git::fetch::Error;
 use cargo_metadata::TargetKind;
 use cargo_metadata::{
     Metadata, Package,
@@ -18,9 +19,12 @@ use cargo_metadata::{
     semver::Version,
 };
 use chrono::NaiveDate;
-use std::path::PathBuf;
+use git_cmd::Repo;
+use std::fmt::format;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
 use toml_edit::TableLike;
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 // Used to indicate that this is a dummy commit with no corresponding ID available.
 // It should be at least 7 characters long to avoid a panic in git-cliff
@@ -75,25 +79,94 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
     };
 
     let release_packages = if input.git_only().is_some()
-    // If we are only using git-only mode, we parse the commits in the unpublished repositry using
-    // the git_only_release_tag_regex until we reach a commit that matches the spec. At that point
-    // we need to checkout that version somewhere on our local file system. We can then pass on.
+    // If we are only using git-only mode, we get release information from git tags rather than
+    // using a registry of some kind. The steps are roughly as follows:
     //
-    // TODO: Implement this :D
+    // 1. Get the path to the local package with the unreleased changes (i.e working copy)
+    // 2. Create a git worktree somewhere in /tmp at the current commit (HEAD), we'll call it
+    //    WT_CURRENT
+    // 3. Inspect the commit log in WT_CURRENT until we find a commit that satisfies our tag
+    //    release regex, call it commit X
+    // 4. Create a second git worktree in /tmp , and checkout to commit X, we'll call it
+    //    WT_LATEST_RELEASE
+    // 5. Run cargo package in WT_LATEST_RELEASE to create the crate tarball
+    // 6. Extract it somewhere in /tmp, probably just inside of the WT_LATEST_RELEASE, call it
+    //    LATEST_PACKAGE
+    // 7. Get the path to LATEST_PACKAGE, and return it
+    //
+    //
+    // NOTE: We may actually have to run `cargo package` in the unreleased version worktree (i.e our
+    // current copy) to ensure that we are comparing properly. I assume that this is already
+    // handled somewhere because we can run this command in a standard rust project (not just
+    // within a cargo package dir)
+    // TODO: Verify this ^
     {
         debug!("Git only mode enabled, using git tags for release info");
 
+        let unreleased_package_dir = input
+            .local_manifest_dir()
+            .context("get local manifest dir")?
+            .parent()
+            .context("get local manifest dir parent")?;
+
+        let unreleased_package_repo = Repo::new(&unreleased_package_dir)
+            .context("init repo object for unreleased package")?;
+
+        // I chose to use path names that shouldn't conflict and allow inspecting them if needed
+        let unreleased_package_worktree_path = format!(
+            "/tmp/{}/unreleased/{}",
+            input.cargo_metadata().workspace_root,
+            chrono::Utc::now()
+        );
+        debug!("unreleased worktree located at {unreleased_package_worktree_path}");
+
+        // We still have to check if this worktree exists already. It shouldn't, but because NTP
+        // could in theory step the clock back, we may as well check.
+        let f = tokio::fs::File::open(&unreleased_package_worktree_path).await;
+
+        // doesn't exist, great
+        if f.as_ref().is_err_and(|x| x.kind() == ErrorKind::NotFound) {
+            debug!("{unreleased_package_worktree_path} not found, nothing to delete");
+        }
+        // does exist, delete it
+        else {
+            match f?.metadata().await {
+                Ok(m) if m.is_dir() => {
+                    warn!(
+                        "{unreleased_package_worktree_path} already exists, are you a time traveller? Just kidding, but we are deleting it for consistency"
+                    );
+                    tokio::fs::remove_dir_all(&unreleased_package_worktree_path)
+                        .await
+                        .context("delete existing unreleased package")?;
+                }
+
+                // either file or symlink, i don't think we care though? we'll just remove it
+                Ok(_) => {
+                    warn!(
+                        "{unreleased_package_worktree_path} already exists as a file, deleting it"
+                    );
+                    tokio::fs::remove_file(&unreleased_package_worktree_path)
+                        .await
+                        .context("delete existing unreleased package file")?;
+                }
+
+                // if its not found, then great!
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            };
+        }
+
+        // create the worktree at HEAD
+        let unreleased_package_worktree = unreleased_package_repo
+            .add_worktree(unreleased_package_worktree_path, None)
+            .context("create git worktree")?;
+
+        // now we scan the commit history to find the commits that satisfy
+
         // If the local manifest path is populated (i.e from CLI args) then we always prefer that,
         // otherwise we'll create a local copy of the released package and provide the path to its
-        // Cargo.toml
-        let local_release_path = input.registry_manifest().unwrap_or_else(|| {
-            // copy the release checkout into /tmp using git worktrees
-
-            // make it look like a package release... somehow?
-
-            // get & return the path to the Cargo.toml
-            Utf8Path::new("")
-        });
+        // Cargo.toml.
+        let local_release_path = Utf8Path::new("");
+        let local_release_path = input.registry_manifest().unwrap_or(local_release_path);
         debug!("Using local package for current latest release info at {local_release_path}");
 
         // we can just pass on our local copy of the package, the rest of the system doesn't even

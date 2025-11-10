@@ -12,6 +12,7 @@ use crate::{
     tmp_repo::TempRepo,
 };
 use anyhow::Context;
+use cargo::ops::info;
 use cargo_metadata::TargetKind;
 use cargo_metadata::{
     Metadata, Package,
@@ -23,7 +24,7 @@ use git_cmd::Repo;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use toml_edit::TableLike;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 // Used to indicate that this is a dummy commit with no corresponding ID available.
 // It should be at least 7 characters long to avoid a panic in git-cliff
@@ -64,6 +65,7 @@ impl ReleaseMetadataBuilder for UpdateRequest {
 /// The temp repository is the
 #[instrument(skip_all)]
 pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, TempRepo)> {
+    info!("determining next version");
     let overrides = input.packages_config().overridden_packages();
     let local_project = Project::new(
         input.local_manifest(),
@@ -102,61 +104,65 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
     {
         debug!("Git only mode enabled, using git tags for release info");
 
-        let unreleased_package_dir = input
-            .local_manifest_dir()
-            .context("get local manifest dir")?
-            .parent()
-            .context("get local manifest dir parent")?;
-
-        let unreleased_package_repo = Repo::new(&unreleased_package_dir)
-            .context("init repo object for unreleased package")?;
-
-        // I chose to use path names that shouldn't conflict and allow inspecting them if needed
-        let unreleased_package_worktree_path = format!(
-            "/tmp/{}/unreleased/{}",
-            input.cargo_metadata().workspace_root,
-            chrono::Utc::now()
-        );
-        debug!("unreleased worktree located at {unreleased_package_worktree_path}");
-
-        // delete the existing worktree if it exists
-        // TODO: I think we may actually do this prior to calling this function (where the other
-        // TODO is, if that is the case, delete it here )
-        delete_existing_worktree(unreleased_package_worktree_path.as_str().into())
-            .await
-            .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
-
-        // create the worktree at HEAD
-        let unreleased_package_worktree = unreleased_package_repo
-            .add_worktree(&unreleased_package_worktree_path, None)
-            .context("create git worktree")?;
+        // create a repo at the unreleased package worktree
+        // TODO: This was already done in the parent. Do we really have to do this again?
+        let unreleased_package_worktree: Repo = Repo::new(
+            input
+                .local_manifest_dir()
+                .context("get unreleased package dir parent")?,
+        )
+        .context("open git repo for unreleased worktree")?;
 
         // now we scan the commit history to find the commits that satisfy our regex
-        // TODO
-        let commit = "this isnt a sha1 you silly goose";
+        // TODO: Probably don't use unwrap here, or atleast make sure we've checked it prior to
+        // this invocation
+        let tag_with_commit: Option<(String, String)> = unreleased_package_worktree
+            .get_tags_with_commits()
+            .context("get tags with commits")?
+            .iter()
+            .filter(|x| input.git_only_release_regex().unwrap().is_match(&x.0))
+            .next()
+            .cloned();
 
-        // create a new worktree at the specfied commit
-        let latest_release_package_path = format!(
-            "/tmp/{}/latest_release",
-            input.cargo_metadata().workspace_root,
-        );
-        debug!("latest release worktree located at {latest_release_package_path}");
-        delete_existing_worktree(latest_release_package_path.as_str().into())
-            .await
-            .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
+        let mut local_release_path: Option<String> = None;
 
-        // create our new copy of the worktree
-        let latest_release_worktree = unreleased_package_repo
-            .add_worktree(&latest_release_package_path, Some(commit))
-            .context("create git worktree")?;
+        if let Some((tag, commit)) = tag_with_commit {
+            info!(
+                "tag {} matched release regex {:?} with commit {commit}",
+                tag,
+                input.git_only_release_regex()
+            );
 
-        // run cargo package to produce our package
-        run_cargo(latest_release_package_path.as_str().into(), &["package"])
-            .context("create cargo package")?;
+            // create a new worktree at the specfied commit
+            let latest_release_worktree_path = "/tmp/latest_release";
+            debug!("latest release worktree located at {latest_release_worktree_path}");
+            delete_existing_worktree(latest_release_worktree_path.into())
+                .await
+                .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
 
-        // create a git repository in the packaged version
-        // pretty sure theres a git client we can use for this
-        // TODO
+            // create a worktree for the latest released version
+            let _latest_release_worktree = unreleased_package_worktree
+                .add_worktree(&latest_release_worktree_path, Some(&commit))
+                .context("create git worktree for latest release")?;
+
+            // run cargo package to produce our package
+            run_cargo(latest_release_worktree_path.into(), &["package"])
+                .context("create cargo package")?;
+
+            let latest_release_package_path =
+                format!("{latest_release_worktree_path}/target/package");
+
+            // create a git repository in the packaged version to make sure comparisons are equivilent
+            Repo::init_simple(&latest_release_package_path)
+                .context("create git repo for package dir")?;
+
+            local_release_path = Some(latest_release_package_path);
+        }
+        // NOTE: If no tags match the regex, I believe we default to using the registry for the
+        // first release, which will throw and error, and instead say the
+        else {
+            warn!("No tag found that matches regex, defaulting to current implementation");
+        }
 
         // get the path to the new packaged version, the updated path is at
         // /tmp/package_name/target/package/package_name-0.1.0
@@ -165,18 +171,23 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
         // would be a directory for each of the packages in the workspace, but they aren't in a
         // real workspace from cargos perspective.
 
+        let local_release_path_utf8: Option<Utf8PathBuf> =
+            local_release_path.map(|s| Utf8PathBuf::from(s));
+
         // If the local manifest path is populated (i.e from CLI args) then we always prefer that,
         // otherwise we'll create a local copy of the released package and provide the path to its
         // Cargo.toml.
-        let local_release_path = format!("{latest_release_package_path}/target/package");
-        let local_release_path = Utf8Path::new(&local_release_path);
-        let local_release_path = input.registry_manifest().unwrap_or(local_release_path);
-        debug!("Using local package for current latest release info at {local_release_path}");
+        let local_release_path = match input.registry_manifest() {
+            Some(s) => Some(s.into()),
+            None => local_release_path_utf8,
+        };
+
+        debug!("Using local package for current latest release info at {local_release_path:?}");
 
         // we can just pass on our local copy of the package, the rest of the system doesn't even
         // have to know
         registry_packages::get_registry_packages(
-            Some(local_release_path),
+            local_release_path.as_deref(),
             &local_project.publishable_packages(),
             input.registry(),
         )

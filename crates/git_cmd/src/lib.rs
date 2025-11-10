@@ -37,6 +37,29 @@ impl Repo {
         })
     }
 
+    /// Initializes git within a directory.
+    /// Returns Ok(None) if the repository is already initialized, otherwise returns a repo
+    /// NOTE: This function doesn't set the author / email, nor does it provide any commits. Some
+    /// git actions may behave differently if there isn't a commit.
+    #[instrument(skip(path), fields(path = path.as_ref().as_str()))]
+    pub fn init_simple(path: impl AsRef<Utf8Path>) -> anyhow::Result<Option<Self>> {
+        // first, we check if the repo exists
+        if std::path::Path::new(&format!("{}/.git", path.as_ref().as_str())).exists() {
+            debug!(
+                "git repository already exists at {}, not creating a new one",
+                path.as_ref()
+            );
+            return Ok(None);
+        }
+
+        // create the repo
+        git_in_dir(path.as_ref(), &["init"]).context("init git directory")?;
+        let repo = Repo::new(&path).context("create new git repository")?;
+        debug!("created new git repository at {}", path.as_ref());
+
+        Ok(Some(repo))
+    }
+
     pub fn directory(&self) -> &Utf8Path {
         &self.directory
     }
@@ -224,16 +247,10 @@ impl Repo {
         object: Option<&str>,
     ) -> anyhow::Result<Self> {
         if let Some(commit) = object {
-            self.git(&[
-                "worktree",
-                "add",
-                "--detach",
-                path.as_ref().as_str(),
-                commit,
-            ])
-            .context("create git worktree at {object}")?;
+            self.git(&["worktree", "add", "-f", path.as_ref().as_str(), commit])
+                .context(format!("create git worktree at commit {commit}"))?;
         } else {
-            self.git(&["worktree", "add", path.as_ref().as_str()])
+            self.git(&["worktree", "add", "-f", path.as_ref().as_str()])
                 .context("create git worktree at HEAD")?;
         }
 
@@ -246,6 +263,38 @@ impl Repo {
             .context("failed to remove worktree")?;
 
         Ok(())
+    }
+
+    // NOTE: Because we are potentially switching to a git crate like git2, I am keeping this
+    // interface as general as possible rather than creating new types for CommitHash or GitTag. If
+    // we end up scrapping that, it may be worth creating those types.
+    //
+    // NOTE: creatordate sorts by commit date, most recent first, so we should get the tag that
+    // matches the release regex for the most recent commit.
+    #[instrument(skip(self))]
+    pub fn get_tags_with_commits(&self) -> anyhow::Result<Vec<(String, String)>> {
+        let o = self
+            .git(&[
+                "for-each-ref",
+                "--sort=-creatordate",
+                "--format=%(refname:short) %(object)",
+                "refs/tags",
+            ])
+            .context("get tags with messages")?;
+
+        // split up input into lines of the following structure:
+        // v0.1.0 3214bd8bd2f36c5e7ae55f1f85994eb6f952b08c
+        let lines: Vec<String> = o.split("\n").map(|x| x.to_string()).collect();
+
+        // now we split each line into their components
+        let split_lines: Vec<(String, String)> = lines
+            .iter()
+            .filter(|line| line.contains(" ")) // if something doesn't have a space, we just filter
+            .map(|x| x.split_at(x.find(" ").unwrap())) // unwrap should be safe because of ^
+            .map(|(y, z)| (y.to_string(), z.to_string()))
+            .collect();
+
+        Ok(split_lines)
     }
 
     /// Get `nth` commit starting from `1`.

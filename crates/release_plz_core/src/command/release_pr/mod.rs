@@ -14,8 +14,8 @@ use crate::git::forge::{
 use crate::git::github_graphql;
 use crate::pr::{DEFAULT_BRANCH_PREFIX, OLD_BRANCH_PREFIX, Pr};
 use crate::{
-    PackagesUpdate, copy_to_temp_dir, new_manifest_dir_path, new_project_root,
-    publishable_packages_from_manifest, root_repo_path_from_manifest_dir, update,
+    PackagesUpdate, delete_existing_worktree, publishable_packages_from_manifest,
+    root_repo_path_from_manifest_dir, update,
 };
 
 use super::update_request::UpdateRequest;
@@ -119,31 +119,45 @@ pub struct PrPackageRelease {
 ///   are up-to-date.
 #[instrument(skip_all)]
 pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<ReleasePr>> {
+    info!("release pr");
     // the manifest we'll be updating with the PR (i.e package_version)
     let manifest_dir = input.update_request.local_manifest_dir()?;
 
     // In both local and CI, we'll be checking out HEAD of the default branch, which we don't want
     // to update directly. Instead, we create a local copy that we can update. Then we can create a
     // PR from that.
-    //
-    // TODO: This should be done with git worktrees, rather than copying directly
-    // See 3245cf0
-    let original_project_root = root_repo_path_from_manifest_dir(manifest_dir)?;
-    let tmp_project_root_parent = copy_to_temp_dir(&original_project_root)?;
-    let tmp_project_manifest_dir = new_manifest_dir_path(
-        &original_project_root,
-        manifest_dir,
-        tmp_project_root_parent.path(),
-    )?;
+
+    let unreleased_package_dir = root_repo_path_from_manifest_dir(manifest_dir)?;
+    info!("unreleased package dir: {unreleased_package_dir}");
+
+    let unreleased_package_repo =
+        Repo::new(&unreleased_package_dir).context("init repo object for unreleased package")?;
+
+    // I chose to use path names that shouldn't conflict and allow inspecting them if needed
+    // TODO: These should actually be random
+    let unreleased_package_worktree_path = format!(
+        "/tmp/unreleased/{}",
+        chrono::Utc::now().format("%d_%m_%Y_%H_%M")
+    );
+    debug!("unreleased worktree located at {unreleased_package_worktree_path}");
+
+    // delete the existing worktree if it exists
+    delete_existing_worktree(unreleased_package_worktree_path.as_str().into())
+        .await
+        .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
+
+    // create the worktree at HEAD
+    let _unreleased_package_worktree = unreleased_package_repo
+        .add_worktree(&unreleased_package_worktree_path, None)
+        .context("create git worktree for unreleased package")?;
+
+    let local_manifest: &Utf8Path = Utf8Path::new(&unreleased_package_worktree_path);
+    let local_manifest = local_manifest.join(CARGO_TOML);
+    info!("updating local manifest to {local_manifest:?}");
 
     // users can attach labels to pull requests for whatever reason they want, but we need to make
     // sure that they conform to our spec.
     validate_labels(&input.labels)?;
-    let tmp_project_root =
-        new_project_root(&original_project_root, tmp_project_root_parent.path())?;
-
-    // update the local manifest to our new copied directory
-    let local_manifest = tmp_project_manifest_dir.join(CARGO_TOML);
 
     // update the update request with the new local manifest
     let new_update_request = input
@@ -161,14 +175,13 @@ pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<Relea
         .git_client()?
         .context("can't find git client")?;
     if !packages_to_update.updates().is_empty() {
-        let repo = Repo::new(tmp_project_root)?;
-        let there_are_commits_to_push = repo.is_clean().is_err();
+        let there_are_commits_to_push = unreleased_package_repo.is_clean().is_err();
         if there_are_commits_to_push {
             let pr = open_or_update_release_pr(
                 &local_manifest,
                 &packages_to_update,
                 &git_client,
-                &repo,
+                &unreleased_package_repo,
                 ReleasePrOptions {
                     draft: input.draft,
                     pr_name: input.pr_name_template.clone(),

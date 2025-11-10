@@ -19,6 +19,7 @@ use crate::{changelog_config, config::Config};
 use super::{
     config_path::ConfigPath, manifest_command::ManifestCommand, repo_command::RepoCommand,
 };
+use regex::Regex;
 
 /// Update your project locally, without opening a PR.
 /// If `repo_url` contains a GitHub URL, release-plz uses it to add a release
@@ -181,12 +182,16 @@ impl Update {
         check_if_cargo_lock_is_ignored_and_committed(&project_manifest)?;
 
         // create the update request
+        // TODO: Not sure this is the correct way to implement git only here, since CLI args could
+        // be passed as well
         let mut update = UpdateRequest::new(cargo_metadata)
             .with_context(|| {
                 format!("Cannot find file {project_manifest:?}. Make sure you are inside a rust project or that --manifest-path points to a valid Cargo.toml file.")
             })?
             .with_dependencies_update(self.dependencies_update(config))
-            .with_allow_dirty(self.allow_dirty(config));
+            .with_allow_dirty(self.allow_dirty(config))
+            .with_git_only(config.workspace.git_only)
+            .with_git_only_release_regex(config.workspace.git_only_release_regex.clone().map(|x| Regex::new(&x).unwrap()));
 
         // the repository url is used for links within the changelogs to the release
         // normally you don't need to populate it because release-plz will default to the remote

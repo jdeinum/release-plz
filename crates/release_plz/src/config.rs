@@ -167,17 +167,13 @@ pub struct Workspace {
     pub release_always: Option<bool>,
 
     /// Use git tags for release information
-    /// Default: false
+    /// Default: None
     ///
-    /// If true, release-plz will use git tags to determine what the latest version of the package
+    /// If Some(x), release-plz will use git tags to determine what the latest version of the package
     /// is (i.e newest version is v.0.1.3 and is associated with commit ac83762)
-    /// If false, release-plz will use crates.io release information to get the latest version
+    /// If None, release-plz will use crates.io release information to get the latest version
     ///
-    /// If you use this, you're required to provide a regex that is used to match against tag
-    /// messages in order to distinguish a release versus some other tag
-    pub git_only: Option<bool>,
-
-    /// The regex used to identity releases from git tags
+    /// x must be a valid regular expression that identifies releases for packages
     /// Because git tags can have arbitrary messages attached to them, release-plz needs some way
     /// of knowing the difference between a release and non release.
     ///
@@ -397,6 +393,22 @@ pub struct PackageConfig {
     /// # Release
     /// Used to toggle off the update/release process for a workspace or package.
     pub release: Option<bool>,
+
+    /// Use git tags for release information
+    /// Default: None
+    ///
+    /// If Some(x), release-plz will use git tags to determine what the latest version of the package
+    /// is (i.e newest version is v.0.1.3 and is associated with commit ac83762)
+    /// If None, release-plz will use crates.io release information to get the latest version
+    ///
+    /// x must be a valid regular expression that identifies releases for packages
+    /// Because git tags can have arbitrary messages attached to them, release-plz needs some way
+    /// of knowing the difference between a release and non release.
+    ///
+    /// NOTE: The tag needs to contain a semantic version somewhere in the tag. If it doesn't, we
+    /// should error out early. A better option may be that we can specify a prefix and postfix as
+    /// separate fields and expect a full a.b.c in the middle, that way users can never forget it
+    pub git_only_release_regex: Option<String>,
 }
 
 impl From<PackageConfig> for release_plz_core::UpdateConfig {
@@ -409,6 +421,7 @@ impl From<PackageConfig> for release_plz_core::UpdateConfig {
             tag_name_template: config.git_tag_name,
             features_always_increment_minor: config.features_always_increment_minor == Some(true),
             changelog_path: config.changelog_path.map(|p| to_utf8_pathbuf(p).unwrap()),
+            git_only_release_regex: config.git_only_release_regex,
         }
     }
 }
@@ -448,6 +461,9 @@ impl PackageConfig {
             git_tag_enable: self.git_tag_enable.or(default.git_tag_enable),
             git_tag_name: self.git_tag_name.or(default.git_tag_name),
             release: self.release.or(default.release),
+            git_only_release_regex: self
+                .git_only_release_regex
+                .or(default.git_only_release_regex),
         }
     }
 
@@ -537,7 +553,6 @@ mod tests {
                 publish_timeout: Some("10m".to_string()),
                 release_commits: Some("^feat:".to_string()),
                 release_always: None,
-                git_only: None,
                 git_only_release_regex: None,
             },
             package: [].into(),
@@ -663,7 +678,6 @@ mod tests {
                 publish_timeout: Some("10m".to_string()),
                 release_commits: Some("^feat:".to_string()),
                 release_always: None,
-                git_only: None,
                 git_only_release_regex: None,
             },
             package: [PackageSpecificConfigWithName {

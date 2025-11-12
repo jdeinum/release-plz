@@ -19,7 +19,6 @@ use cargo_metadata::{
 };
 use chrono::NaiveDate;
 use git_cmd::Repo;
-use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use toml_edit::TableLike;
@@ -79,7 +78,7 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
         req: input,
     };
 
-    let release_packages = if input.git_only().is_some()
+    let release_packages = if input.git_only_release_regex().is_some()
     // If we are only using git-only mode, we get release information from git tags rather than
     // using a registry of some kind. The steps are roughly as follows:
     //

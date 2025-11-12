@@ -21,8 +21,25 @@ pub struct UpdateConfig {
     /// - If `true`, feature commits will always bump the minor version, even in 0.x releases.
     /// - If `false` (default), feature commits will only bump the minor version starting with 1.x releases.
     pub features_always_increment_minor: bool,
+
     /// Template for the git tag created by release-plz.
     pub tag_name_template: Option<String>,
+
+    /// Use git tags for release information
+    /// Default: None
+    ///
+    /// If Some(x), release-plz will use git tags to determine what the latest version of the package
+    /// is (i.e newest version is v.0.1.3 and is associated with commit ac83762)
+    /// If None, release-plz will use crates.io release information to get the latest version
+    ///
+    /// x must be a valid regular expression that identifies releases for packages
+    /// Because git tags can have arbitrary messages attached to them, release-plz needs some way
+    /// of knowing the difference between a release and non release.
+    ///
+    /// NOTE: The tag needs to contain a semantic version somewhere in the tag. If it doesn't, we
+    /// should error out early. A better option may be that we can specify a prefix and postfix as
+    /// separate fields and expect a full a.b.c in the middle, that way users can never forget it
+    pub git_only_release_regex: Option<String>,
 }
 
 /// Package-specific config
@@ -70,6 +87,7 @@ impl Default for UpdateConfig {
             features_always_increment_minor: false,
             tag_name_template: None,
             changelog_path: None,
+            git_only_release_regex: None,
         }
     }
 }

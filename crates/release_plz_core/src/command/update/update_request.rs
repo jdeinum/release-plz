@@ -46,9 +46,6 @@ pub struct UpdateRequest {
     release_commits: Option<Regex>,
     git: Option<GitForge>,
 
-    /// Use git tags to determine latest package release
-    git_only: Option<bool>,
-
     /// The regex used to determine releases from git tags
     /// TODO: We may have to split this up into a prefix and suffix
     git_only_release_regex: Option<Regex>,
@@ -71,7 +68,6 @@ impl UpdateRequest {
             packages_config: PackagesConfig::default(),
             release_commits: None,
             git: None,
-            git_only: None,
             git_only_release_regex: None,
         })
     }
@@ -240,17 +236,8 @@ impl UpdateRequest {
         self.release_commits.as_ref()
     }
 
-    pub fn git_only(&self) -> Option<bool> {
-        self.git_only
-    }
-
     pub fn git_only_release_regex(&self) -> Option<&Regex> {
         self.git_only_release_regex.as_ref()
-    }
-
-    pub fn with_git_only(mut self, git_only: Option<bool>) -> Self {
-        self.git_only = git_only;
-        self
     }
 
     pub fn with_git_only_release_regex(mut self, git_only_release_regex: Option<Regex>) -> Self {

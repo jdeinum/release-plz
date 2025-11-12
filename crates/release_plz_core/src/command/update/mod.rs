@@ -5,7 +5,7 @@ mod update_config;
 pub mod update_request;
 pub mod updater;
 
-use crate::{PackagePath, tmp_repo::TempRepo};
+use crate::PackagePath;
 use crate::{fs_utils, root_repo_path_from_manifest_dir};
 use anyhow::Context;
 use cargo_metadata::camino::Utf8Path;
@@ -38,7 +38,7 @@ pub struct ReleaseInfo {
 
 /// Update a local Rust project.
 #[instrument(skip_all)]
-pub async fn update(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, TempRepo)> {
+pub async fn update(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, Repo)> {
     let (packages_to_update, repository) = crate::next_versions(input)
         .await
         .context("failed to determine next versions")?;

@@ -9,7 +9,6 @@ use crate::{
     package_path::manifest_dir,
     registry_packages::{self},
     semver_check::SemverCheck,
-    tmp_repo::TempRepo,
 };
 use anyhow::Context;
 use cargo_metadata::TargetKind;
@@ -20,6 +19,7 @@ use cargo_metadata::{
 };
 use chrono::NaiveDate;
 use git_cmd::Repo;
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use toml_edit::TableLike;
@@ -30,7 +30,7 @@ use tracing::{debug, info, instrument, trace, warn};
 // (Git-cliff assumes it's a valid commit ID).
 pub(crate) const NO_COMMIT_ID: &str = "0000000";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReleaseMetadata {
     /// Template for the git tag created by release-plz.
     pub tag_name_template: Option<String>,
@@ -63,9 +63,10 @@ impl ReleaseMetadataBuilder for UpdateRequest {
 /// Any packages that will be updated will be returned, alongside whether we update the workspace
 /// The temp repository is the
 #[instrument(skip_all)]
-pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, TempRepo)> {
+pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpdate, Repo)> {
     info!("determining next version");
     let overrides = input.packages_config().overridden_packages();
+
     let local_project = Project::new(
         input.local_manifest(),
         input.single_package(),
@@ -149,16 +150,33 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
                 .context("create cargo package")?;
 
             let latest_release_package_path =
-                format!("{latest_release_worktree_path}/target/package/test_release_plz-0.1.0");
+                format!("{latest_release_worktree_path}/target/package");
+
+            // at this point we need to update the latest_release path for all of the packages
+            // we do that by finding the name of the published directory from the input, and
+            // replacing the base path to that of the {latest_release_worktree/target/package} so
+            // that all of the local manifests point into our packaged versions in /tmp
+            let mut local_project_copy = local_project.clone();
+            local_project_copy
+                .workspace_packages_mut()
+                .iter_mut()
+                .for_each(|x| {
+                    x.manifest_path =
+                        format!("{}/{}-{}", latest_release_package_path, x.name, x.version).into();
+                });
+            info!("local_project_copy: {local_project_copy:?}");
+
+            // now we need to initialize a git repo in each of the repo packages
+            // TODO
 
             // create a git repository in the packaged version to make sure comparisons are equivilent
             info!(
                 "initializing git repo in the latest release package at {latest_release_package_path}"
             );
-            Repo::init_simple(&latest_release_package_path)
-                .context("create git repo for package dir")?;
+            // Repo::init_simple(&latest_release_package_path)
+            //     .context("create git repo for package dir")?;
 
-            local_release_path = Some(format!("{latest_release_package_path}/Cargo.toml"));
+            local_release_path = Some(format!("{latest_release_worktree_path}/Cargo.toml"));
         }
         // NOTE: If no tags match the regex, I believe we default to using the registry for the
         // first release, which will throw and error, and instead say the
@@ -207,21 +225,27 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
     }?;
 
     // The repository that contains the unpublished changes
-    let unreleased_repo = local_project
-        .get_repo()
-        .context("failed to determine local project repository")?;
+    let unreleased_worktree = Repo::new(
+        input
+            .local_manifest()
+            .parent()
+            .context("get local manifest parent")?,
+    )
+    .context("create unreleased worktree")?;
+
+    info!("unreleased_worktree: {unreleased_worktree:?}");
 
     // If our unreleased_repo contains changes that aren't checked in to git and we don't allow
     // dirty repos, we error out. Otherwise, we just stash the changes. Note that because these
     // changes aren't commited, no version change would occur because of them.
-    let repo_is_clean_result = unreleased_repo.repo.is_clean();
+    let repo_is_clean_result = unreleased_worktree.is_clean();
     if !input.allow_dirty() {
         repo_is_clean_result?;
     } else if repo_is_clean_result.is_err() {
         // Stash uncommitted changes so we can freely check out other commits.
         // This function is ran inside a temporary repository, so this has no
         // effects on the original repository of the user.
-        unreleased_repo.repo.git(&[
+        unreleased_worktree.git(&[
             "stash",
             "push",
             "--include-untracked",
@@ -233,11 +257,11 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
     let packages_to_update = updater
         .packages_to_update(
             &release_packages,
-            &unreleased_repo.repo,
+            &unreleased_worktree,
             input.local_manifest(),
         )
         .await?;
-    Ok((packages_to_update, unreleased_repo))
+    Ok((packages_to_update, unreleased_worktree))
 }
 
 pub async fn delete_existing_worktree(path: &Utf8Path) -> anyhow::Result<()> {

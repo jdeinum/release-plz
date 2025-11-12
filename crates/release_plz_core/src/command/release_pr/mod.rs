@@ -123,10 +123,6 @@ pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<Relea
     // the manifest we'll be updating with the PR (i.e package_version)
     let manifest_dir = input.update_request.local_manifest_dir()?;
 
-    // In both local and CI, we'll be checking out HEAD of the default branch, which we don't want
-    // to update directly. Instead, we create a local copy that we can update. Then we can create a
-    // PR from that.
-
     let unreleased_package_dir = root_repo_path_from_manifest_dir(manifest_dir)?;
     info!("unreleased package dir: {unreleased_package_dir}");
 

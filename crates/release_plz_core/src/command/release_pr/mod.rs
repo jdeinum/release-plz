@@ -2,10 +2,12 @@ use cargo_metadata::camino::{Utf8Path, Utf8PathBuf};
 use cargo_metadata::semver::Version;
 use cargo_utils::CARGO_TOML;
 use git_cmd::Repo;
+mod git;
+mod utils;
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use serde::Serialize;
-use tracing::{debug, info, instrument};
+use tracing::{debug, error, info, instrument};
 use url::Url;
 
 use crate::git::forge::{
@@ -19,8 +21,15 @@ use crate::{
 };
 
 use super::update_request::UpdateRequest;
+use crate::command::release_pr::git::CustomRepo;
+use crate::command::release_pr::utils::{GitPackage, MD5Hash, PackageState, ToPackage};
+use cargo::ops::info;
+use cargo_metadata::{Package, PackageName};
+use git2::{Repository, Worktree, WorktreeAddOptions};
 use regex::Regex;
 use std::cell::OnceCell;
+use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct ReleasePrRequest {
@@ -114,47 +123,6 @@ pub struct PrPackageRelease {
     version: Version,
 }
 
-/// An internal package is meant to point to any directory created by `cargo package`, there is no
-/// actual checks being made on whether this is true, this will need to be done at some point.
-/// TODO: Implement checks to make sure this is a cargo package
-/// CORRECTNESS: We assume that files are not changed after the hash of the package is generated
-#[derive(Clone, Debug)]
-pub struct PackageDir {
-    pub path: Utf8PathBuf,
-    pub hash: OnceCell<[u8; 16]>,
-}
-
-impl PackageDir {
-    // Try variant is still unstable :(
-    // TODO: Check if the try version is stabilized
-    pub fn md5_hash(&self) -> [u8; 16] {
-        self.hash
-            .get_or_init(|| {
-                // list out all files in that directory, including hidden ones in sorted order
-
-                // collect all of their hashes
-
-                // hash the joined result
-
-                // set your own hash
-                [0; 16]
-            })
-            .to_owned()
-    }
-
-    pub fn same_contents(&self, other: &PackageDir) -> bool {
-        self.md5_hash() == other.md5_hash()
-    }
-}
-
-#[derive(Debug)]
-pub struct PackageToUpdate {
-    pub name: String,
-    pub update_regex: Regex,
-    pub previous_release_commit: Option<String>,
-    pub previous_release_commit_index: Option<usize>,
-}
-
 /// Open a pull request with the next packages versions of a local rust project
 /// Returns:
 /// - [`ReleasePr`] if release-plz opened or updated a PR.
@@ -162,169 +130,65 @@ pub struct PackageToUpdate {
 ///   are up-to-date.
 #[instrument(skip_all)]
 pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<ReleasePr>> {
-    // First, we'll create a worktree for the current unreleased project in /tmp as before at HEAD.
-    // So we don't accidentally mess with the working directory.
+    // Get the path of our project according to the manifest path
     let unreleased_project_base_path = input
         .update_request
         .local_manifest_dir()
-        .context("get local manfiest")?;
+        .context("get manfiest dir for unreleased project")?;
     info!("unreleased project base path: {unreleased_project_base_path}");
-    let unreleased_project_repo = Repo::new(&unreleased_project_base_path)
-        .context("init repo object for unreleased package")?;
-    let unreleased_project_worktree_path = format!(
-        "/tmp/unreleased/{}",
-        chrono::Utc::now().format("%d_%m_%Y_%H_%M")
-    );
-    info!("unreleased project worktree path: {unreleased_project_worktree_path}");
-    delete_existing_worktree(unreleased_project_worktree_path.as_str().into())
-        .await
-        .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
-    unreleased_project_repo
-        .add_worktree(&unreleased_project_worktree_path, None)
-        .context("create git worktree for unreleased project")?;
-    let local_manifest: &Utf8Path = Utf8Path::new(&unreleased_project_worktree_path);
-    let local_manifest = local_manifest.join(CARGO_TOML);
-    info!("updating local manifest to {local_manifest:?}");
 
-    // Next, we'll run all of our verifications
-    // We should still check assumptions in future functions with something like ensure, but this
-    // makes it easy to know where to add / look for verification steps.
-    // TODO
+    // create the repo that we'll use to spawn other worktrees from
+    let unreleased_project_repo = CustomRepo::open(unreleased_project_base_path.as_str())
+        .context("create unreleased project repository")?;
+
+    // run repo validation
     validate_labels(&input.labels).context("validate PR request labels")?;
+    // TODO
 
-    // Next, we need to iterate through each package, and get the package for the latest release.
-    // If the package comes from a registry of some kind, we can find the latest release easily
-    // In the case of basing releases on git tags, we need to get the repository state at the time
-    // of the release that matched some git tag. If any of the packages do not have a match for a
-    // release tag, we should default assume that the current released version is 0.1.0. We then
-    // need to get the sha of each package, and stick it in a map of package_name -> sha
-    //
-    // NOTE: At the current moment, I will assume all of the packages are using git only.
-    let mut packages_to_update: Vec<PackageToUpdate> = input
+    // get our git only packages
+    let packages: Vec<GitPackage> = input
         .update_request
         .cargo_metadata()
         .packages
         .iter()
-        .map(|x| PackageToUpdate {
-            name: x.name.to_string(),
-            update_regex: input
-                .update_request
-                .git_only_release_regex()
-                .unwrap()
-                .clone(),
-            previous_release_commit: None,
-            previous_release_commit_index: None,
+        .map(|p| {
+            let regex = Regex::new("v(([0-9]\\.?)+)").unwrap();
+
+            GitPackage {
+                package_name: p.name.clone(),
+                git_tag_release_regex: regex,
+            }
         })
         .collect();
 
-    let commits = unreleased_project_repo
-        .get_tags_with_commits()
-        .context("get tags + commits for unreleased project")?;
-    packages_to_update.iter_mut().for_each(|p| {
-        // for each package, find the most recent commit that matches its release tag regex
-        for (index, (tag, commit)) in commits.iter().enumerate() {
-            if p.update_regex.is_match(&tag) {
-                info!(
-                    "tag {tag} matched regex {} for package {}",
-                    p.update_regex, p.name
-                );
-                p.previous_release_commit = Some(commit.clone());
-                p.previous_release_commit_index = Some(index)
-            }
-        }
-    });
+    // now that we have our packages, we need to convert them into releases
+    let latest_releases: HashMap<PackageName, PackageState> = packages
+        .into_iter()
+        .map(|p| {
+            let package_worktree = unreleased_project_repo
+                .temp_worktree(Some(p.package_name.clone().as_ref()), &p.package_name)
+                .map_err(|e| {
+                    error!("Error creating temp worktree: {e:?}");
+                    e
+                })
+                .unwrap();
+            let name = p.package_name.clone();
+            let ps: PackageState = p.try_visit_git_package(package_worktree).unwrap();
+            (name, ps)
+        })
+        .collect();
 
-    info!("packages to update: {packages_to_update:?}");
-
-    // oldest commit is used when we walk the git history in the unreleased version
-    let oldest_commit: Option<(usize, Option<String>)> = packages_to_update
+    let rv: Vec<(PackageName, Version, MD5Hash)> = latest_releases
         .iter()
         .map(|x| {
             (
-                // TODO: When 0, we pretty much ignore packages with no previous release. In
-                // reality, i think we'll set this to len() so that we look through all commits
-                // since the project inception, and assume the current version is 0.1.0.
-                x.previous_release_commit_index.unwrap_or(0),
-                x.previous_release_commit.clone(),
+                x.0.clone(),
+                x.1.metadata.workspace_packages()[0].version.clone(),
+                x.1.md5_hash.clone(),
             )
         })
-        .max_by(|a, b| a.0.cmp(&b.0));
-
-    // for each of the packages we are going to update, we need to set the worktree back to that
-    // commit so we can get both the version of the package at that time, and the sha1 of the
-    // package. The sha1 is optional, and if it doesn't exist, then we assume we walk the entire
-    // tree.
-
-    // Next, starting at the current commit, we need to do the following for each package:
-    // 1. Remove /target/package (maybe? or cargo publish will be smart enough to handle that)
-    // 2. Run cargo package
-    // 3. For each package, get the sha.
-    // 4. For each sha, compare to sha for the latest release
-    //      a. if they are the same, that package is considered complete
-    //      b. if the sha is the same as last time around, do nothing
-    //      c. if the sha is different than last time around, that commit affected this package,
-    //      store it somewhere.
-    // 5. When we've reached the oldest commit, (i.e all packages are done), we have everything we
-    //    need
-
-    // Next, determine the next version for each of the packages
-
-    // Next, Send er!
-
-    //   info!("release pr");
-    //   // the manifest we'll be updating with the PR (i.e package_version)
-    //
-    //   let unreleased_package_dir = root_repo_path_from_manifest_dir(manifest_dir)?;
-    //   info!("unreleased package dir: {unreleased_package_dir}");
-    //
-    //   let unreleased_package_repo =
-    //
-    //
-    //   // I chose to use path names that shouldn't conflict and allow inspecting them if needed
-    //   // TODO: These should actually be random
-    //
-    //   debug!("unreleased worktree located at {unreleased_package_worktree_path}");
-
-    // create the worktree at HEAD
-
-    // // users can attach labels to pull requests for whatever reason they want, but we need to make
-    // // sure that they conform to our spec.
-    //
-    // // update the update request with the new local manifest
-    // let new_update_request = input
-    //     .update_request
-    //     .clone()
-    //     .set_local_manifest(&local_manifest)
-    //     .context("can't find temporary project")?;
-    //
-    // // determine what packages we will be updating
-    // let (packages_to_update, _temp_repository) = update(&new_update_request)
-    //     .await
-    //     .context("failed to update packages")?;
-    // let git_client = input
-    //     .update_request
-    //     .git_client()?
-    //     .context("can't find git client")?;
-    // if !packages_to_update.updates().is_empty() {
-    //     let there_are_commits_to_push = unreleased_package_repo.is_clean().is_err();
-    //     if there_are_commits_to_push {
-    //         let pr = open_or_update_release_pr(
-    //             &local_manifest,
-    //             &packages_to_update,
-    //             &git_client,
-    //             &unreleased_package_repo,
-    //             ReleasePrOptions {
-    //                 draft: input.draft,
-    //                 pr_name: input.pr_name_template.clone(),
-    //                 pr_body: input.pr_body_template.clone(),
-    //                 pr_labels: input.labels.clone(),
-    //                 pr_branch_prefix: input.branch_prefix.clone(),
-    //             },
-    //         )
-    //         .await?;
-    //         return Ok(Some(pr));
-    //     }
-    // }
+        .collect();
+    info!("latest releases: {rv:?}");
 
     Ok(None)
 }

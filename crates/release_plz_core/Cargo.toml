@@ -31,7 +31,7 @@ fs-err = { workspace = true, features = ["tokio"] }
 git-cliff-core.workspace = true
 git-url-parse.workspace = true
 h2.workspace = true
-ignore.workspace = true
+ignore = "=0.4.25"
 itertools.workspace = true
 parse-changelog.workspace = true
 rand.workspace = true
@@ -55,6 +55,9 @@ tokio = { workspace = true, features = ["fs", "macros"] }
 tera.workspace = true
 http.workspace = true
 urlencoding.workspace = true
+git2 = "0.20.2"
+md5 = "0.8.0"
+bytes = "1.10.1"
 
 [dev-dependencies]
 git_cmd = { path = "../git_cmd", features = ["test_fixture"] }

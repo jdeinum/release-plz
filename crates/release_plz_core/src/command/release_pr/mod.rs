@@ -7,6 +7,7 @@ use anyhow::Context;
 use serde::Serialize;
 use tracing::{debug, info, instrument};
 use url::Url;
+pub(crate) mod git;
 
 use crate::git::forge::{
     ForgeType, GitClient, GitPr, PrEdit, contributors_from_commits, validate_labels,
@@ -19,6 +20,7 @@ use crate::{
 };
 
 use super::update_request::UpdateRequest;
+use crate::command::release_pr::git::CustomRepo;
 
 #[derive(Debug)]
 pub struct ReleasePrRequest {
@@ -119,35 +121,28 @@ pub struct PrPackageRelease {
 ///   are up-to-date.
 #[instrument(skip_all)]
 pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<ReleasePr>> {
-    info!("release pr");
-    // the manifest we'll be updating with the PR (i.e package_version)
-    let manifest_dir = input.update_request.local_manifest_dir()?;
+    // get the path of our project according to the manifest path
+    let unreleased_project_base_path = input
+        .update_request
+        .local_manifest_dir()
+        .context("get manfiest dir for unreleased project")?;
+    info!("unreleased project base path: {unreleased_project_base_path}");
 
-    let unreleased_package_dir = root_repo_path_from_manifest_dir(manifest_dir)?;
-    info!("unreleased package dir: {unreleased_package_dir}");
+    // create the repo that we'll use to spawn other worktrees from
+    let unreleased_project_repo = CustomRepo::open(unreleased_project_base_path.as_str())
+        .context("create unreleased project repository")?;
 
-    let unreleased_package_repo =
-        Repo::new(&unreleased_package_dir).context("init repo object for unreleased package")?;
+    // create the unreleased worktree, where we point our local manifest to
+    let unreleased_project_worktree = unreleased_project_repo
+        .temp_worktree(Some("unreleased"), "unreleased")
+        .context("create worktree for unreleased worktree")?;
 
-    // I chose to use path names that shouldn't conflict and allow inspecting them if needed
-    // TODO: These should actually be random
-    let unreleased_package_worktree_path = format!(
-        "/tmp/unreleased/{}",
-        chrono::Utc::now().format("%d_%m_%Y_%H_%M")
-    );
-    debug!("unreleased worktree located at {unreleased_package_worktree_path}");
-
-    // delete the existing worktree if it exists
-    delete_existing_worktree(unreleased_package_worktree_path.as_str().into())
-        .await
-        .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
-
-    // create the worktree at HEAD
-    unreleased_package_repo
-        .add_worktree(&unreleased_package_worktree_path, None)
-        .context("create git worktree for unreleased package")?;
-
-    let local_manifest: &Utf8Path = Utf8Path::new(&unreleased_package_worktree_path);
+    let unreleased_project_worktree_path = unreleased_project_worktree
+        .path()
+        .to_str()
+        .ok_or(anyhow::Error::msg("convert os string to path"))?
+        .to_string();
+    let local_manifest: &Utf8Path = Utf8Path::new(&unreleased_project_worktree_path);
     let local_manifest = local_manifest.join(CARGO_TOML);
     info!("updating local manifest to {local_manifest:?}");
 
@@ -170,14 +165,22 @@ pub async fn release_pr(input: &ReleasePrRequest) -> anyhow::Result<Option<Relea
         .update_request
         .git_client()?
         .context("can't find git client")?;
+
+    let unreleased_package_worktree_repo = Repo::new(
+        local_manifest
+            .parent()
+            .ok_or(anyhow::Error::msg("no parent"))?,
+    )
+    .context("create new repo")?;
+
     if !packages_to_update.updates().is_empty() {
-        let there_are_commits_to_push = unreleased_package_repo.is_clean().is_err();
+        let there_are_commits_to_push = unreleased_package_worktree_repo.is_clean().is_err();
         if there_are_commits_to_push {
             let pr = open_or_update_release_pr(
                 &local_manifest,
                 &packages_to_update,
                 &git_client,
-                &unreleased_package_repo,
+                &unreleased_package_worktree_repo,
                 ReleasePrOptions {
                     draft: input.draft,
                     pr_name: input.pr_name_template.clone(),

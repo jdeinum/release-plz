@@ -1,4 +1,6 @@
 use crate::cargo::run_cargo;
+use crate::command::git::{CustomRepo, CustomWorkTree};
+use crate::registry_packages::{PackagesCollection, RegistryPackage};
 use crate::update_request::UpdateRequest;
 use crate::updater::Updater;
 use crate::{
@@ -11,17 +13,19 @@ use crate::{
     semver_check::SemverCheck,
 };
 use anyhow::Context;
-use cargo_metadata::TargetKind;
 use cargo_metadata::{
     Metadata, Package,
     camino::{Utf8Path, Utf8PathBuf},
     semver::Version,
 };
+use cargo_metadata::{MetadataCommand, PackageName, TargetKind};
 use chrono::NaiveDate;
 use git_cmd::Repo;
-use std::collections::HashMap;
+use git2::Oid;
+use std::collections::{BTreeMap, HashMap};
 use std::io::ErrorKind;
 use std::path::PathBuf;
+use std::process::Stdio;
 use toml_edit::TableLike;
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -79,138 +83,119 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
         req: input,
     };
 
-    let release_packages = if input.git_only().is_some()
-    // If we are only using git-only mode, we get release information from git tags rather than
-    // using a registry of some kind. The steps are roughly as follows:
-    //
-    // 1. Get the path to the local package with the unreleased changes (i.e working copy)
-    // 2. Create a git worktree somewhere in /tmp at the current commit (HEAD), we'll call it
-    //    WT_CURRENT
-    // 3. Inspect the commit log in WT_CURRENT until we find a commit that satisfies our tag
-    //    release regex, call it commit X
-    // 4. Create a second git worktree in /tmp , and checkout to commit X, we'll call it
-    //    WT_LATEST_RELEASE
-    // 5. Run cargo package in WT_LATEST_RELEASE to create the crate tarball
-    // 6. Extract it somewhere in /tmp, probably just inside of the WT_LATEST_RELEASE, call it
-    //    LATEST_PACKAGE
-    // 7. Get the path to LATEST_PACKAGE, and return it
-    //
-    //
-    // NOTE: We may actually have to run `cargo package` in the unreleased version worktree (i.e our
-    // current copy) to ensure that we are comparing properly. I assume that this is already
-    // handled somewhere because we can run this command in a standard rust project (not just
-    // within a cargo package dir)
-    // TODO: Verify this ^
-    {
+    // collect our packages
+    let mut res: BTreeMap<String, RegistryPackage> = BTreeMap::new();
+
+    // SAFETY: We need to prevent the worktrees from being dropped because they'll error out
+    // otherwise
+    let mut worktrees: Vec<CustomWorkTree> = Vec::new();
+
+    let release_packages = if input.git_only().is_some() {
         debug!("Git only mode enabled, using git tags for release info");
 
-        // create a repo at the unreleased package worktree
-        // TODO: This was already done in the parent. Do we really have to do this again?
-        let unreleased_package_worktree: Repo = Repo::new(
+        // create the repo we'll be spinning worktrees from, in this case, themselves worktrees!
+        let unreleased_project_repo = CustomRepo::open(
             input
                 .local_manifest_dir()
-                .context("get unreleased package dir parent")?,
+                .context("get local manifest dir")?,
         )
-        .context("open git repo for unreleased worktree")?;
+        .context("create unreleased repo for spinning worktrees")?;
 
-        // now we scan the commit history to find the commits that satisfy our regex
-        // TODO: Probably don't use unwrap here, or atleast make sure we've checked it prior to
-        // this invocation
-        let tag_with_commit: Option<(String, String)> = unreleased_package_worktree
-            .get_tags_with_commits()
-            .context("get tags with commits")?
-            .iter()
-            .filter(|x| input.git_only_release_regex().unwrap().is_match(&x.0))
-            .next()
-            .cloned();
+        let release_regex = input.git_only_release_regex().unwrap();
 
-        let mut local_release_path: Option<String> = None;
+        // create a commit for each package
+        for package in input.cargo_metadata().workspace_packages() {
+            // make a worktree for the package
+            let worktree = unreleased_project_repo
+                .temp_worktree(Some(package.name.to_string().as_str()), &package.name)
+                .context("build worktree for package")?;
 
-        if let Some((tag, commit)) = tag_with_commit {
-            info!(
-                "tag {} matched release regex {:?} with commit {commit}",
-                tag,
-                input.git_only_release_regex()
-            );
+            // create repo at new worktree
+            let mut repo = CustomRepo::open(worktree.path()).context("open repo for package")?;
 
-            // create a new worktree at the specfied commit
-            let latest_release_worktree_path = "/tmp/latest_release";
-            debug!("latest release worktree located at {latest_release_worktree_path}");
-            delete_existing_worktree(latest_release_worktree_path.into())
-                .await
-                .with_context(|| "delete existing worktree for unreleased_package_worktree_path")?;
+            // get the tags
+            let tags = repo.get_tags().context("get tags for package")?;
 
-            // create a worktree for the latest released version
-            unreleased_package_worktree
-                .add_worktree(&latest_release_worktree_path, Some(&commit))
-                .context("create git worktree for latest release")?;
+            // find the release tag
+            let release_tag: Option<String> =
+                tags.into_iter().find(|tag| release_regex.is_match(&tag));
 
-            // run cargo package to produce our package
-            run_cargo(latest_release_worktree_path.into(), &["package"])
-                .context("create cargo package")?;
+            match release_tag {
+                None => {
+                    unimplemented!("Can't handle the case where release commit isn't defined yet")
+                }
 
-            let latest_release_package_path =
-                format!("{latest_release_worktree_path}/target/package");
+                Some(rt) => {
+                    // get the commit associated with this tag
+                    let release_commit =
+                        repo.get_tag_commit(&rt).context("get release tag commit")?;
 
-            // at this point we need to update the latest_release path for all of the packages
-            // we do that by finding the name of the published directory from the input, and
-            // replacing the base path to that of the {latest_release_worktree/target/package} so
-            // that all of the local manifests point into our packaged versions in /tmp
-            let mut local_project_copy = local_project.clone();
-            local_project_copy
-                .workspace_packages_mut()
-                .iter_mut()
-                .for_each(|x| {
-                    x.manifest_path =
-                        format!("{}/{}-{}", latest_release_package_path, x.name, x.version).into();
-                });
-            info!("local_project_copy: {local_project_copy:?}");
+                    // checkout that commit in the worktree
+                    repo.checkout_commit(&release_commit)
+                        .context("checkout release commit for package")?;
 
-            // now we need to initialize a git repo in each of the repo packages
-            // TODO
+                    // run cargo publish so we get the proper format
+                    let c = std::process::Command::new("cargo")
+                        .args(["package"])
+                        .current_dir(worktree.path())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()
+                        .context("run cargo package in worktree")?;
+                    let _x = c.wait_with_output().context("wait for cargo package")?;
 
-            // create a git repository in the packaged version to make sure comparisons are equivilent
-            info!(
-                "initializing git repo in the latest release package at {latest_release_package_path}"
-            );
-            // Repo::init_simple(&latest_release_package_path)
-            //     .context("create git repo for package dir")?;
+                    // create the package / registry Package
+                    let rust_package = MetadataCommand::new()
+                        .manifest_path(format!(
+                            "{}/Cargo.toml",
+                            worktree.path().to_str().unwrap_or_default()
+                        ))
+                        .exec()
+                        .context("get cargo metadata")?;
 
-            local_release_path = Some(format!("{latest_release_worktree_path}/Cargo.toml"));
+                    let package_details = rust_package
+                        .packages
+                        .iter()
+                        .filter(|x| x.name == package.name)
+                        .next()
+                        .unwrap();
+
+                    let new_path = format!(
+                        "{}/target/package/{}-{}",
+                        worktree.path().to_str().unwrap_or_default(),
+                        package_details.name,
+                        package_details.version
+                    );
+                    info!("package for {} is at {}", package.name, new_path);
+
+                    // SEE SAFETY NOTE ABOVE
+                    worktrees.push(worktree);
+
+                    // create the package
+                    let single_package_meta = MetadataCommand::new()
+                        .manifest_path(format!("{}/Cargo.toml", new_path))
+                        .exec()
+                        .context("get cargo metadata")?;
+
+                    // get the package details
+                    let single_package = single_package_meta
+                        .workspace_packages()
+                        .into_iter()
+                        .find(|p| p.name == package.name)
+                        .ok_or(anyhow::Error::msg("Couldn't find the package"))?
+                        .clone();
+
+                    // add it to the B Tree map
+                    res.insert(
+                        single_package.name.to_string(),
+                        RegistryPackage::new(single_package, Some(release_commit)),
+                    );
+                }
+            }
         }
-        // NOTE: If no tags match the regex, I believe we default to using the registry for the
-        // first release, which will throw and error, and instead say the
-        else {
-            warn!("No tag found that matches regex, defaulting to current implementation");
-        }
 
-        // get the path to the new packaged version, the updated path is at
-        // /tmp/package_name/target/package/package_name-0.1.0
-        // so either we need to use the specific version from metadata or we need to find it
-        // dynamically. Once thing I am, unsure about is how this plays out with workspaces. There
-        // would be a directory for each of the packages in the workspace, but they aren't in a
-        // real workspace from cargos perspective.
-
-        let local_release_path_utf8: Option<Utf8PathBuf> =
-            local_release_path.map(|s| Utf8PathBuf::from(s));
-
-        // If the local manifest path is populated (i.e from CLI args) then we always prefer that,
-        // otherwise we'll create a local copy of the released package and provide the path to its
-        // Cargo.toml.
-        let local_release_path = match input.registry_manifest() {
-            Some(s) => Some(s.into()),
-            None => local_release_path_utf8,
-        };
-
-        debug!("Using local package for current latest release info at {local_release_path:?}");
-
-        // we can just pass on our local copy of the package, the rest of the system doesn't even
-        // have to know
-        registry_packages::get_registry_packages(
-            local_release_path.as_deref(),
-            &local_project.publishable_packages(),
-            input.registry(),
-        )
+        worktrees.iter().for_each(|x| info!("{:?}", x.path()));
+        Ok(PackagesCollection::default().with_packages(res))
     }
     // Retrieve the latest published version of the packages.
     // Release-plz will compare the registry packages with the local packages,

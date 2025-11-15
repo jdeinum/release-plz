@@ -136,10 +136,10 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
 
                     // run cargo publish so we get the proper format
                     let c = std::process::Command::new("cargo")
-                        .args(["package"])
+                        .args(["package", "--allow-dirty"])
                         .current_dir(worktree.path())
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
+                        // .stdout(Stdio::null())
+                        // .stderr(Stdio::null())
                         .spawn()
                         .context("run cargo package in worktree")?;
                     let _x = c.wait_with_output().context("wait for cargo package")?;
@@ -168,9 +168,6 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
                     );
                     info!("package for {} is at {}", package.name, new_path);
 
-                    // SEE SAFETY NOTE ABOVE
-                    worktrees.push(worktree);
-
                     // create the package
                     let single_package_meta = MetadataCommand::new()
                         .manifest_path(format!("{}/Cargo.toml", new_path))
@@ -190,11 +187,13 @@ pub async fn next_versions(input: &UpdateRequest) -> anyhow::Result<(PackagesUpd
                         single_package.name.to_string(),
                         RegistryPackage::new(single_package, Some(release_commit)),
                     );
+
+                    // SEE SAFETY NOTE ABOVE
+                    worktrees.push(worktree);
                 }
             }
         }
 
-        worktrees.iter().for_each(|x| info!("{:?}", x.path()));
         Ok(PackagesCollection::default().with_packages(res))
     }
     // Retrieve the latest published version of the packages.

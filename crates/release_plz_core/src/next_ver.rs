@@ -1,4 +1,3 @@
-use crate::cargo::run_cargo;
 use crate::command::git::{CustomRepo, CustomWorkTree};
 use crate::registry_packages::{PackagesCollection, RegistryPackage};
 use crate::update_request::UpdateRequest;
@@ -18,11 +17,10 @@ use cargo_metadata::{
     camino::{Utf8Path, Utf8PathBuf},
     semver::Version,
 };
-use cargo_metadata::{MetadataCommand, PackageName, TargetKind};
+use cargo_metadata::{MetadataCommand, TargetKind};
 use chrono::NaiveDate;
 use git_cmd::Repo;
-use git2::Oid;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::process::Stdio;

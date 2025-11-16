@@ -61,6 +61,7 @@ impl Updater<'_> {
         let packages_diffs = self
             .get_packages_diffs(registry_packages, repository)
             .await?;
+
         let version_groups = self.get_version_groups(&packages_diffs);
         debug!("version groups: {:?}", version_groups);
 
@@ -506,9 +507,17 @@ impl Updater<'_> {
         repository
             .checkout_head()
             .context("can't checkout head to calculate diff")?;
+
+        info!(
+            package = package.name.to_string(),
+            "repo head before getting diff: {:?}",
+            repository.current_commit_hash().unwrap()
+        );
+
         let registry_package = registry_packages.get_registry_package(&package.name);
         let mut diff = Diff::new(registry_package.is_some());
         let pathbufs_to_check = pathbufs_to_check(&package_path, package)?;
+
         let paths_to_check: Vec<&Path> = pathbufs_to_check.iter().map(|p| p.as_ref()).collect();
         repository
             .checkout_last_commit_at_paths(&paths_to_check)
@@ -566,9 +575,21 @@ impl Updater<'_> {
     ) -> anyhow::Result<()> {
         let pathbufs_to_check = pathbufs_to_check(package_path, package)?;
         let paths_to_check: Vec<&Path> = pathbufs_to_check.iter().map(|p| p.as_ref()).collect();
+        info!(
+            "paths to check for package {} is {pathbufs_to_check:?}",
+            package.name
+        );
+
+        info!(
+            "first commit in repo: {}",
+            repository.current_commit_message().unwrap()
+        );
+
         loop {
             let current_commit_message = repository.current_commit_message()?;
             let current_commit_hash = repository.current_commit_hash()?;
+
+            info!("commit {current_commit_hash}: {current_commit_message}");
 
             // Check if files changed in git commit belong to the current package.
             // This is required because a package can contain another package in a subdirectory.
@@ -589,6 +610,10 @@ impl Updater<'_> {
                     package_path,
                     registry_package_path,
                 ).with_context(|| format!("failed to check package equality for `{}` at commit {current_commit_hash}", package.name))?;
+                debug!(
+                    "registry package at path {} and package for commit {} are the same: {}",
+                    registry_package_path, current_commit_hash, are_packages_equal
+                );
                 if are_packages_equal
                     || is_commit_too_old(
                         repository,
@@ -771,6 +796,7 @@ impl Updater<'_> {
             .get_cargo_lock_path(repository)
             .context("failed to determine Cargo.lock path")?;
         let package_files_res = get_package_files(package_path, repository);
+        info!("package files files: {package_files_res:?}");
         if let Some(cargo_lock_path) = cargo_lock_path.as_deref() {
             // Revert any changes to `Cargo.lock`
             repository

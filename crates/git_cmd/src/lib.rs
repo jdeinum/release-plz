@@ -8,7 +8,7 @@ use std::{collections::HashSet, path::Path, process::Command};
 
 use anyhow::{Context, anyhow};
 use camino::{Utf8Path, Utf8PathBuf};
-use tracing::{Span, debug, instrument, trace, warn};
+use tracing::{Span, debug, info, instrument, trace, warn};
 
 /// Repository
 #[derive(Debug)]
@@ -209,6 +209,10 @@ impl Repo {
     /// Checkout to the latest commit.
     pub fn checkout_last_commit_at_paths(&self, paths: &[&Path]) -> anyhow::Result<()> {
         let previous_commit = self.last_commit_at_paths(paths)?;
+        info!(
+            "previous commit at paths {:?} is {}",
+            paths, previous_commit
+        );
         self.checkout(&previous_commit)?;
         Ok(())
     }
